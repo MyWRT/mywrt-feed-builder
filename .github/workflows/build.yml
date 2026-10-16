@@ -205,6 +205,14 @@ jobs:
             --build-dir "$WORK/build" \
             --out-dir "$WORK/merge"
 
+      - name: Upload failure report
+        if: always() && steps.merge.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: failures-${{ matrix.version }}-${{ matrix.arch }}
+          path: .work/merge/failures.json
+          retention-days: 7
+
       - name: Download unchanged archives
         run: |
           set -euo pipefail
@@ -279,5 +287,52 @@ jobs:
         env:
           FAILED: ${{ steps.merge.outputs.failed }}
         run: |
-          echo "::error::Failed packages (the feed keeps their previous build; they are retried next run): $FAILED"
+          echo "::error::Failed packages (the feed keeps their previous build; see the build-failure issues): $FAILED"
           exit 1
+
+  report:
+    name: Report failures
+    needs:
+      - plan
+      - target
+    if: always() && needs.plan.outputs.has_work == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v6
+
+      - name: Download failure reports
+        # No artifacts exist when every target failed before merging; closing still runs.
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: failures-*
+          path: .work/failures
+
+      - name: Set up Rclone
+        uses: AnimMouse/setup-rclone@v1
+        with:
+          rclone_config: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: Resolve storage
+        run: python3 scripts/feedctl.py storage --config targets.toml
+
+      - name: Download published states
+        run: |
+          mkdir -p .work/failures .work/state
+          rclone copy "$STATE_STORE" .work/state
+
+      - name: Update issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 scripts/failure_issues.py \
+            --failures-dir .work/failures \
+            --state-dir .work/state \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --sources-repo "$SOURCES_REPO"
