@@ -15,19 +15,24 @@ state store, `<storage.state>/packages-<version>/<arch>.json`:
         files stay downloadable until the retention policy drops them.
 
 Storage locations are rclone paths from [storage] in targets.toml, overridable
-with the FEED_STORE / STATE_STORE environment variables.
+with the FEED_STORE / STATE_STORE environment variables. Publishing writes the
+archives, then the index (feed store), then the state (state store): the state
+is the commit point, so an interrupted publish only causes a rebuild.
 
-Subcommands, in workflow order:
-    storage -> plan -> target-env
+Subcommands are called in this order by .github/workflows/build.yml:
+    storage -> plan -> target-env -> merge -> carry -> verify -> gc
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
+import email.parser
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -36,6 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 STATE_SCHEMA = 1
+ARCHIVE_SUFFIXES = (".ipk", ".apk")
 
 
 class FeedError(Exception):
@@ -43,6 +49,10 @@ class FeedError(Exception):
 
 
 # --- time ---------------------------------------------------------------
+
+
+def format_time(value: dt.datetime) -> str:
+    return value.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def parse_time(value: str) -> dt.datetime:
@@ -59,6 +69,15 @@ def now_arg(value: str | None) -> dt.datetime:
 def load_json(path: Path):
     with path.open(encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def write_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2, sort_keys=True, ensure_ascii=False)
+        handle.write("\n")
+    tmp.replace(path)
 
 
 def load_config(path: Path) -> dict:
@@ -232,6 +251,147 @@ def plan_target(
     return {"build": build, "remove": remove, "stale_latest": stale_latest, "expired": expired}
 
 
+def source_name(value: str) -> str:
+    return value.rstrip("/").rsplit("/", 1)[-1]
+
+
+def read_index_metadata(directory: Path) -> list[dict]:
+    """Archive metadata from an index dump written by sdk/entry.sh."""
+    manifest = directory / "Packages.manifest"
+    adb_dump = directory / "packages.adb.json"
+    entries = []
+    if manifest.exists():
+        parser = email.parser.Parser()
+        for chunk in manifest.read_text(encoding="utf-8").strip().split("\n\n"):
+            if not chunk.strip():
+                continue
+            fields = parser.parsestr(chunk, headersonly=True)
+            for key in ("Package", "Version", "Source", "Filename"):
+                if not fields.get(key):
+                    raise FeedError(f"{manifest}: entry without {key}: {chunk.splitlines()[0]}")
+            entries.append(
+                {
+                    "filename": fields["Filename"],
+                    "name": fields["Package"],
+                    "version": fields["Version"],
+                    "source": source_name(fields["Source"]),
+                }
+            )
+    elif adb_dump.exists():
+        data = load_json(adb_dump)
+        packages = data.get("packages", []) if isinstance(data, dict) else data
+        for package in packages:
+            for key in ("name", "version", "origin"):
+                if not package.get(key):
+                    raise FeedError(f"{adb_dump}: entry without {key}: {package.get('name')}")
+            entries.append(
+                {
+                    "filename": f"{package['name']}-{package['version']}.apk",
+                    "name": package["name"],
+                    "version": package["version"],
+                    "source": source_name(package["origin"]),
+                }
+            )
+    return entries
+
+
+def merge_state(
+    state: dict,
+    fps: dict[str, str],
+    result: dict,
+    new_files: list[dict],
+    now: dt.datetime,
+    retention: dict,
+) -> tuple[dict, list[str], dict]:
+    """Apply one build result. Returns (new state, accepted filenames, report)."""
+    state = copy.deepcopy(state)
+    packages, files = state["packages"], state["files"]
+    stamp = format_time(now)
+    succeeded = set(result.get("succeeded", []))
+    # Failed builds keep their previous state entry and are retried next run.
+    failed = set(result.get("failed", [])) | set(result.get("download_failed", []))
+    unsupported = set(result.get("unsupported", []))
+
+    unknown = (succeeded | failed | unsupported) - set(fps)
+    if unknown:
+        raise FeedError(f"build result names packages missing from sources: {sorted(unknown)}")
+
+    removed = sorted(set(packages) - set(fps))
+    for name in removed:
+        del packages[name]
+    for name in sorted(succeeded):
+        packages[name] = {"fingerprint": fps[name], "status": "built", "updated_at": stamp}
+    for name in sorted(unsupported):
+        packages[name] = {"fingerprint": fps[name], "status": "unsupported", "updated_at": stamp}
+
+    replaced_sources = succeeded | unsupported
+    retired = []
+    for filename, meta in files.items():
+        if meta["latest"] and (meta["source"] in replaced_sources or meta["source"] not in fps):
+            meta["latest"] = False
+            meta["superseded_at"] = stamp
+            retired.append(filename)
+
+    accepted = []
+    produced = set()
+    for entry in new_files:
+        if entry["source"] not in succeeded:
+            continue
+        files[entry["filename"]] = {
+            "name": entry["name"],
+            "version": entry["version"],
+            "source": entry["source"],
+            "published_at": stamp,
+            "latest": True,
+        }
+        accepted.append(entry["filename"])
+        produced.add(entry["source"])
+
+    names = defaultdict(list)
+    for filename, meta in files.items():
+        if meta["latest"]:
+            names[meta["name"]].append(filename)
+    duplicates = {name: sorted(found) for name, found in names.items() if len(found) > 1}
+    if duplicates:
+        raise FeedError(f"more than one indexed file per package: {duplicates}")
+
+    keep = retention_keep(files, now, retention["days"], retention["min_versions"])
+    deleted = sorted(set(files) - keep)
+    for filename in deleted:
+        del files[filename]
+
+    state["updated_at"] = stamp
+    report = {
+        "succeeded": sorted(succeeded),
+        "failed": sorted(failed),
+        "unsupported": sorted(unsupported),
+        "removed": removed,
+        "empty": sorted(succeeded - produced),
+        "accepted": sorted(accepted),
+        "retired": sorted(name for name in retired if name not in accepted),
+        "expired": deleted,
+    }
+    return state, sorted(accepted), report
+
+
+def apply_remote_listing(state: dict, remote: set[str]) -> tuple[dict, list[str], list[str]]:
+    """Drop indexed files missing remotely and force their sources to rebuild.
+    Returns (state, carry filenames, missing filenames)."""
+    state = copy.deepcopy(state)
+    missing = sorted(
+        name for name, meta in state["files"].items() if meta["latest"] and name not in remote
+    )
+    for name in missing:
+        source = state["files"].pop(name)["source"]
+        state["packages"].pop(source, None)
+    carry = sorted(name for name, meta in state["files"].items() if meta["latest"])
+    return state, carry, missing
+
+
+def gc_candidates(state: dict, index_files: set[str], remote: set[str]) -> list[str]:
+    return sorted(remote - set(state["files"]) - index_files)
+
+
 # --- commands ----------------------------------------------------------------
 
 
@@ -330,6 +490,99 @@ def cmd_target_env(args) -> int:
     return 0
 
 
+def cmd_merge(args) -> int:
+    config = load_config(args.config)
+    now = now_arg(args.now)
+    packages = source_packages(args.sources, config.get("exclude", []))
+    fps = fingerprints(config, packages, args.version)
+    state = load_state(args.state, args.version, args.arch)
+
+    result_path = args.build_dir / "result.json"
+    result = load_json(result_path) if result_path.exists() else {}
+    new_files = read_index_metadata(args.build_dir)
+    for entry in new_files:
+        archive = args.build_dir / "packages" / entry["filename"]
+        if not archive.is_file():
+            raise FeedError(f"indexed archive missing from build output: {entry['filename']}")
+
+    state, accepted, report = merge_state(state, fps, result, new_files, now, config["retention"])
+
+    stage = args.out_dir / "stage"
+    stage.mkdir(parents=True, exist_ok=True)
+    for filename in accepted:
+        shutil.copy2(args.build_dir / "packages" / filename, stage / filename)
+    write_json(args.out_dir / "state.json", state)
+    (args.out_dir / "accepted.txt").write_text("".join(f"{name}\n" for name in accepted), encoding="utf-8")
+    write_json(args.out_dir / "report.json", report)
+
+    lines = [f"### {args.version} {args.arch}", ""]
+    for key in ("succeeded", "failed", "unsupported", "removed", "empty"):
+        if report[key]:
+            lines.append(f"- {key}: `{' '.join(report[key])}`")
+    lines.append(
+        f"- archives: {len(report['accepted'])} new, {len(report['retired'])} retired, "
+        f"{len(report['expired'])} expired"
+    )
+    append_summary(args.summary, "\n".join(lines) + "\n\n")
+    for name in report["empty"]:
+        print(f"::warning::{name} built successfully but produced no {config['feed_name']} archives")
+    github_output(args.github_output, {"failed": " ".join(report["failed"])})
+    print(json.dumps(report, indent=2))
+    return 0
+
+
+def remote_files(path: Path) -> set[str]:
+    """Top-level file names from `rclone lsjson --files-only` output."""
+    return {item["Path"] for item in load_json(path) if not item.get("IsDir") and "/" not in item["Path"]}
+
+
+def cmd_carry(args) -> int:
+    state = load_json(args.state)
+    accepted = set(filter(None, args.accepted.read_text(encoding="utf-8").splitlines()))
+    remote = remote_files(args.remote_list) | accepted
+    state, carry, missing = apply_remote_listing(state, remote)
+    carry = [name for name in carry if name not in accepted]
+    for name in missing:
+        print(f"::warning::{name} is indexed but missing remotely; its source will be rebuilt next run")
+    write_json(args.state, state)
+    args.out.write_text("".join(f"{name}\n" for name in carry), encoding="utf-8")
+    print(f"carry {len(carry)} archives, {len(missing)} missing")
+    return 0
+
+
+def cmd_verify(args) -> int:
+    state = load_json(args.state)
+    expected = {name for name, meta in state["files"].items() if meta["latest"]}
+    indexed = {entry["filename"] for entry in read_index_metadata(args.index_meta)}
+    staged = {path.name for path in args.stage.iterdir() if path.suffix in ARCHIVE_SUFFIXES}
+    problems = []
+    if indexed != expected:
+        problems.append(
+            f"index/state mismatch: only indexed {sorted(indexed - expected)}, "
+            f"only in state {sorted(expected - indexed)}"
+        )
+    if staged != expected:
+        problems.append(
+            f"stage/state mismatch: only staged {sorted(staged - expected)}, "
+            f"only in state {sorted(expected - staged)}"
+        )
+    if expected and not (args.index_dir / "Packages").exists() and not (args.index_dir / "packages.adb").exists():
+        problems.append(f"no index file in {args.index_dir}")
+    if problems:
+        raise FeedError("; ".join(problems))
+    print(f"verified {len(expected)} indexed archives")
+    return 0
+
+
+def cmd_gc(args) -> int:
+    state = load_json(args.state)
+    index_files = {path.name for path in args.index_dir.iterdir() if path.is_file()}
+    delete = gc_candidates(state, index_files, remote_files(args.remote_list))
+    args.out.write_text("".join(f"{name}\n" for name in delete), encoding="utf-8")
+    print(f"{len(delete)} remote files to delete")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -356,6 +609,40 @@ def build_parser() -> argparse.ArgumentParser:
     env.add_argument("--arch", required=True)
     env.add_argument("--github-env", default=os.environ.get("GITHUB_ENV"))
     env.set_defaults(func=cmd_target_env)
+
+    merge = sub.add_parser("merge", help="apply a build result to the target state")
+    merge.add_argument("--config", type=Path, required=True)
+    merge.add_argument("--sources", type=Path, required=True)
+    merge.add_argument("--version", required=True)
+    merge.add_argument("--arch", required=True)
+    merge.add_argument("--state", type=Path, help="current state file (absent = new target)")
+    merge.add_argument("--build-dir", type=Path, required=True)
+    merge.add_argument("--out-dir", type=Path, required=True)
+    merge.add_argument("--now")
+    merge.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
+    merge.add_argument("--summary", default=os.environ.get("GITHUB_STEP_SUMMARY"))
+    merge.set_defaults(func=cmd_merge)
+
+    carry = sub.add_parser("carry", help="list indexed archives to download, dropping ones missing remotely")
+    carry.add_argument("--state", type=Path, required=True)
+    carry.add_argument("--accepted", type=Path, required=True)
+    carry.add_argument("--remote-list", type=Path, required=True)
+    carry.add_argument("--out", type=Path, required=True)
+    carry.set_defaults(func=cmd_carry)
+
+    verify = sub.add_parser("verify", help="check the signed index matches the state")
+    verify.add_argument("--state", type=Path, required=True)
+    verify.add_argument("--stage", type=Path, required=True)
+    verify.add_argument("--index-dir", type=Path, required=True)
+    verify.add_argument("--index-meta", type=Path, required=True)
+    verify.set_defaults(func=cmd_verify)
+
+    gc = sub.add_parser("gc", help="list remote files not referenced by the state or index")
+    gc.add_argument("--state", type=Path, required=True)
+    gc.add_argument("--index-dir", type=Path, required=True)
+    gc.add_argument("--remote-list", type=Path, required=True)
+    gc.add_argument("--out", type=Path, required=True)
+    gc.set_defaults(func=cmd_gc)
     return parser
 
 
