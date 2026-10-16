@@ -675,7 +675,9 @@ def cmd_merge(args) -> int:
         print(f"::warning::{name}: source download failed; it is retried on the next run")
     for name in report["empty"]:
         print(f"::warning::{name} built successfully but produced no {config['feed_name']} archives")
-    github_output(args.github_output, {"failed": " ".join(failure["package"] for failure in failures)})
+    for failure in failures:
+        cause = "build failed" if failure["kind"] == "build" else f"source download failed {DOWNLOAD_ATTEMPTS} runs in a row"
+        print(f"::warning::{failure['package']}: {cause}; the feed keeps its previous build (see the build-failure issue)")
     print(json.dumps(report, indent=2))
     return 0
 
@@ -959,7 +961,6 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument("--build-dir", type=Path, required=True)
     merge.add_argument("--out-dir", type=Path, required=True)
     merge.add_argument("--now")
-    merge.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
     merge.add_argument("--summary", default=os.environ.get("GITHUB_STEP_SUMMARY"))
     merge.set_defaults(func=cmd_merge)
 

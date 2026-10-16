@@ -283,14 +283,6 @@ jobs:
             rclone delete "$REMOTE_FEED" --files-from "$WORK/delete.txt" --no-traverse
           fi
 
-      - name: Fail on package build errors
-        if: steps.merge.outputs.failed != ''
-        env:
-          FAILED: ${{ steps.merge.outputs.failed }}
-        run: |
-          echo "::error::Failed packages (the feed keeps their previous build; see the build-failure issues): $FAILED"
-          exit 1
-
   report:
     name: Report failures
     needs:

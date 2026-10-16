@@ -63,8 +63,9 @@ README（英文版 `README.md` 与中文版 `README_ZH.md`）由 `templates/sour
 
 当 sync 推送了提交、`targets.toml` 发生变化，或手动触发时，`build.yml` 会运行
 （`packages` 强制重建指定软件包，`full_rebuild` 则全部重建）。没有定时构建：状态会与源码
-比对，所以任何一次运行都会补上先前被中断的运行遗漏的内容。如果某次运行因为基础设施原因
-失败，重新运行即可。
+比对，所以任何一次运行都会补上先前被中断的运行遗漏的内容。运行变红表示基础设施出了问题
+（feed 没有发布或只发布了一部分），重新运行即可。软件包构建失败不会让运行失败：feed 照常
+发布，该软件包会得到一条警告注解和一个 `Build failure: <name>` issue。
 
 每个 target 有一个状态文件 `<state store>/packages-<version>/<arch>.json`，逐包记录
 上一次构建所用的指纹和构建结果。指纹把 `<category>/<name>/`（忽略顶层的 `README*`、

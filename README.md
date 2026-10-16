@@ -69,8 +69,10 @@ an unchanged sync produces no commit.
 `build.yml` runs when sync pushes a commit, when `targets.toml` changes, or
 manually (`packages` forces rebuilds, `full_rebuild` rebuilds everything).
 There is no scheduled build: state is compared against the sources, so any run
-picks up whatever an earlier interrupted run missed. If a run fails for
-infrastructure reasons, re-run it.
+picks up whatever an earlier interrupted run missed. A red run means an
+infrastructure problem (nothing or only part of the feed was published); re-run
+it. Package failures do not fail the run: the feed is still published, the
+package gets a warning annotation and a `Build failure: <name>` issue.
 
 Each target has a state file `<state store>/packages-<version>/<arch>.json`
 recording, per package, the fingerprint it was last built with and the outcome.
