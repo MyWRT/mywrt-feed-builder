@@ -1,0 +1,83 @@
+name: Sync sources
+
+on:
+  schedule:
+    - cron: '15 3 * * *'
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'sources.toml'
+      - 'local-patches/**'
+      - 'scripts/sync_sources.py'
+      - 'templates/**'
+      - '.github/workflows/sync.yml'
+
+concurrency:
+  group: sync-sources
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SOURCES_REPO: ${{ vars.SOURCES_REPO || 'MyWRT/mywrt-feed-sources' }}
+
+jobs:
+  sync:
+    name: Sync
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Starting build.yml with GITHUB_TOKEN via workflow_dispatch.
+      actions: write
+
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v6
+
+      - name: Checkout sources
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SOURCES_REPO }}
+          path: feed-sources
+          fetch-depth: 1
+          # Deploy key with write access to the sources repository.
+          ssh-key: ${{ secrets.SOURCES_DEPLOY_KEY }}
+
+      - name: Sync
+        id: sync
+        run: python3 scripts/sync_sources.py --dest feed-sources
+
+      - name: Commit and push
+        id: push
+        working-directory: feed-sources
+        env:
+          UPDATED: ${{ steps.sync.outputs.updated }}
+        run: |
+          set -euo pipefail
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'No changes.'
+            exit 0
+          fi
+          changed="$(git diff --cached --name-only | awk -F/ 'NF > 2 { print $2 }' | sort -u | paste -sd' ')"
+          # The author date is the README's "last updated" time; sync_sources.py reads it back.
+          git -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit --date="$UPDATED" -m "Sync: ${changed:-README}"
+          git push origin HEAD
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "packages_changed=$([[ -n "$changed" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Start build
+        if: steps.push.outputs.packages_changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.push.outputs.sha }}
+        run: |
+          gh workflow run build.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$GITHUB_REF_NAME" \
+            -f sources_sha="$SHA"
