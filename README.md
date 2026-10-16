@@ -1,5 +1,7 @@
 # mywrt-feed-builder
 
+**English** | [中文](README_ZH.md)
+
 Maintains the `mywrt` OpenWrt package feed:
 
 1. **Sync**: fetches the upstream packages listed in `sources.toml`, applies
@@ -37,7 +39,7 @@ flowchart LR
 | `local-patches/feed/<name>/*.patch` | applied to the package directory during sync |
 | `local-patches/source/<name>/*.patch` | copied to `<name>/patches/` for OpenWrt to apply to the upstream source |
 | `targets.toml` | versions, architectures, extra `.config`, storage, retention, `epoch` |
-| `templates/sources-README.md` | README of the sources repository (`${updated}` placeholder) |
+| `templates/sources-README.md`, `templates/sources-README_ZH.md` | READMEs of the sources repository, English and Chinese (`${updated}` placeholder) |
 | `scripts/sync_sources.py` | sync step |
 | `scripts/feedctl.py` | build planning, feed state, retention, garbage collection, catalog |
 | `docs/catalog.md` | format of the published metadata catalog (contract for web front ends) |
@@ -54,7 +56,8 @@ contains the fix: delete the patch). When the generated tree differs, it commits
 `Sync: <changed packages>` and, if packages changed, starts `build.yml` for that
 commit.
 
-The README is rendered from `templates/sources-README.md` with
+The READMEs are rendered from `templates/sources-README.md` and
+`templates/sources-README_ZH.md` with
 [`string.Template`](https://docs.python.org/3/library/string.html#template-strings)
 (`$$` for a literal `$`). `${updated}` is the time packages last changed, in UTC
 (`2026-10-16 03:15 UTC`). Sync commits carry that time as their author date and

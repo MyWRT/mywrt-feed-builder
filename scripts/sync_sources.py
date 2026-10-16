@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Regenerate the mywrt-feed-sources tree from sources.toml and local-patches/.
 
-Output: <category>/<name>/ for every [[package]], plus README.md rendered from
-templates/sources-README.md. Packages are assembled in a temporary directory
-first; any clone, layout or patch error aborts before the destination checkout
-is touched.
+Output: <category>/<name>/ for every [[package]], plus README.md and README_ZH.md
+rendered from templates/sources-README.md and templates/sources-README_ZH.md.
+Packages are assembled in a temporary directory first; any clone, layout or patch
+error aborts before the destination checkout is touched.
 
 local-patches/feed/<name>/*.patch    applied to the package directory (-p1)
 local-patches/source/<name>/*.patch  copied to <name>/patches/ for OpenWrt to apply
@@ -14,7 +14,7 @@ README placeholders (string.Template syntax; write `$$` for a literal `$`):
     ${updated}  when the packages last changed, e.g. "2026-10-16 03:15 UTC"
 The time is now when any package changed, otherwise the author date of the
 current commit, so re-running a sync without package changes reproduces the
-same README. Commit with `--date` set to the `updated` output to keep it so.
+same READMEs. Commit with `--date` set to the `updated` output to keep it so.
 """
 
 from __future__ import annotations
@@ -158,11 +158,16 @@ def git(dest: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", str(dest), *args], capture_output=True, text=True)
 
 
-def last_update(dest: Path, now: dt.datetime) -> dt.datetime:
-    """`now` if the package tree differs from HEAD (or there is no HEAD), else HEAD's author date."""
+def last_update(dest: Path, now: dt.datetime, generated: dict[str, Path]) -> dt.datetime:
+    """`now` if the package tree differs from HEAD (or there is no HEAD), else HEAD's author date.
+
+    `generated` maps the files sync writes back into the checkout to their templates.
+    replace_checkout() deletes them first, so their absence must not count as a change.
+    """
     if git(dest, "rev-parse", "--verify", "--quiet", "HEAD").returncode != 0:
         return now
-    status = git(dest, "status", "--porcelain", "--untracked-files=all", "--", ".", ":(exclude)README.md")
+    excludes = [f":(exclude){name}" for name in generated]
+    status = git(dest, "status", "--porcelain", "--untracked-files=all", "--", ".", *excludes)
     if status.returncode != 0:
         raise SyncError(f"git status failed in {dest}: {status.stderr.strip()}")
     if status.stdout.strip():
@@ -186,6 +191,12 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=ROOT / "sources.toml")
     parser.add_argument("--patches", type=Path, default=ROOT / "local-patches")
     parser.add_argument("--readme-template", type=Path, default=ROOT / "templates" / "sources-README.md")
+    parser.add_argument(
+        "--readme-zh-template",
+        type=Path,
+        default=ROOT / "templates" / "sources-README_ZH.md",
+        help="template for README_ZH.md (default: templates/sources-README_ZH.md)",
+    )
     parser.add_argument("--now", help="override the current time (YYYY-MM-DDTHH:MM:SSZ)")
     parser.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
     args = parser.parse_args()
@@ -204,10 +215,13 @@ def main() -> int:
             locations = fetch(packages, workdir, tree)
             apply_patches(args.patches, tree, locations)
             # Render before touching the checkout so template errors leave it intact.
-            render_readme(args.readme_template, now)
+            readmes = {"README.md": args.readme_template, "README_ZH.md": args.readme_zh_template}
+            for template in readmes.values():
+                render_readme(template, now)
             replace_checkout(args.dest, tree)
-        updated = last_update(args.dest, now)
-        (args.dest / "README.md").write_text(render_readme(args.readme_template, updated), encoding="utf-8")
+        updated = last_update(args.dest, now, readmes)
+        for name, template in readmes.items():
+            (args.dest / name).write_text(render_readme(template, updated), encoding="utf-8")
     except SyncError as error:
         print(f"::error::{error}", file=sys.stderr)
         return 1

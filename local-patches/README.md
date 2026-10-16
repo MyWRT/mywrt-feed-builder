@@ -1,5 +1,7 @@
 # Local patches
 
+**English** | [中文](README_ZH.md)
+
 Applied by `scripts/sync_sources.py` right after the upstream packages are fetched, so the
 tree pushed to mywrt-feed-sources is already patched. `<name>` is the package name from
 `sources.toml`.

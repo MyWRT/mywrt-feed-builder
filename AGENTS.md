@@ -41,7 +41,9 @@ Each one protects published feeds or data; keep them when changing code.
   is replaced).
 - **README time round-trips through git.** `${updated}` is the time packages
   last changed; `sync.yml` commits with `--date "$UPDATED"` and the next sync
-  reads the author date back, so unchanged syncs produce no commit.
+  reads the author date back, so unchanged syncs produce no commit. Both rendered
+  files (`README.md`, `README_ZH.md`) are excluded from that timestamp and from
+  the commit's changed-package list.
 - **Package names are unique across categories**; both sync and `feedctl`
   enforce it.
 - **Signing keys exist only in the index step**, in `$RUNNER_TEMP/keys`,
@@ -67,6 +69,11 @@ Each one protects published feeds or data; keep them when changing code.
   25.12 build when touching `apk_meta()`.
 - rclone exit codes 3/4 mean "not found" (first run); every other non-zero code
   must fail the step.
+- **README filenames carry a suffix.** `sync.yml`'s `awk -F/ 'NF > 2 { print $2 }'`
+  commit summary splits on `/` and would otherwise list a top-level `README_ZH.md`
+  as a changed package; `feedctl.ignored_for_build()` matches `README*`, so
+  renaming either rendered file away from that prefix would put it into the
+  fingerprint.
 - `GITHUB_TOKEN`-triggered `workflow_dispatch` starts runs, which is how sync
   starts builds; a `GITHUB_TOKEN` push would not trigger workflows.
 - The generated sources repository has no `.gitignore`: the old builder's
