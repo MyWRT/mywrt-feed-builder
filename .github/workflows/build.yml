@@ -1,0 +1,283 @@
+name: Build feed
+
+on:
+  workflow_dispatch:
+    inputs:
+      sources_sha:
+        description: mywrt-feed-sources commit to build (default branch when empty)
+        type: string
+        default: ''
+      packages:
+        description: Force-rebuild these packages in addition to changed ones (space or comma separated)
+        type: string
+        default: ''
+      full_rebuild:
+        description: Rebuild every package
+        type: boolean
+        default: false
+  push:
+    branches:
+      - main
+    paths:
+      # Part of the build recipe; affected versions are rebuilt.
+      - 'targets.toml'
+
+concurrency:
+  group: mywrt-feed-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SOURCES_REPO: ${{ vars.SOURCES_REPO || 'MyWRT/mywrt-feed-sources' }}
+  # Optional overrides of [storage] in targets.toml.
+  FEED_STORE: ${{ vars.FEED_STORE }}
+  STATE_STORE: ${{ vars.STATE_STORE }}
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      has_work: ${{ steps.plan.outputs.has_work }}
+      sources_commit: ${{ steps.plan.outputs.sources_commit }}
+
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v6
+
+      - name: Checkout sources
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SOURCES_REPO }}
+          ref: ${{ inputs.sources_sha || '' }}
+          path: feed-sources
+          fetch-depth: 1
+          ssh-key: ${{ secrets.SOURCES_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Set up Rclone
+        uses: AnimMouse/setup-rclone@v1
+        with:
+          rclone_config: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: Resolve storage
+        run: python3 scripts/feedctl.py storage --config targets.toml
+
+      - name: Download feed state
+        run: |
+          set -euo pipefail
+          mkdir -p .work/state
+          # Exit code 3 (directory not found) means a first run; any other error must stop the run.
+          rc=0
+          rclone copy "$STATE_STORE" .work/state || rc=$?
+          case "$rc" in
+            0) ;;
+            3) echo 'No feed state yet; every package will be built.' ;;
+            *) exit "$rc" ;;
+          esac
+          find .work/state -type f -print
+
+      - name: Plan
+        id: plan
+        env:
+          PACKAGES: ${{ inputs.packages || '' }}
+          FULL_REBUILD: ${{ inputs.full_rebuild && 'true' || 'false' }}
+        run: |
+          args=()
+          [[ "$FULL_REBUILD" != true ]] || args+=(--full)
+          python3 scripts/feedctl.py plan \
+            --config targets.toml \
+            --sources feed-sources \
+            --state-dir .work/state \
+            --packages "$PACKAGES" \
+            "${args[@]}"
+
+  target:
+    name: ${{ matrix.version }} ${{ matrix.arch }}
+    needs: plan
+    if: needs.plan.outputs.has_work == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      VERSION: ${{ matrix.version }}
+      ARCH: ${{ matrix.arch }}
+      PACKAGES: ${{ matrix.packages }}
+
+    steps:
+      - name: Maximize runner disk space
+        if: env.PACKAGES != ''
+        uses: justinthelaw/maximize-github-runner-space@v0.9.0
+        with:
+          cleanup-profile: max
+          skip-components: docker-engine
+          swapfile-size: 2G
+
+      - name: Checkout builder
+        uses: actions/checkout@v6
+
+      - name: Checkout sources
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SOURCES_REPO }}
+          ref: ${{ needs.plan.outputs.sources_commit }}
+          path: feed-sources
+          fetch-depth: 1
+          ssh-key: ${{ secrets.SOURCES_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Prepare target
+        run: |
+          python3 scripts/feedctl.py target-env \
+            --config targets.toml \
+            --version "$VERSION" \
+            --arch "$ARCH"
+
+      - name: Set up Rclone
+        uses: AnimMouse/setup-rclone@v1
+        with:
+          rclone_config: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: Download target state
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK"
+          # Exit codes 3/4 (not found) mean a new target; any other error must stop the run.
+          rc=0
+          rclone copyto "$REMOTE_STATE" "$WORK/state.json" || rc=$?
+          case "$rc" in
+            0) ;;
+            3 | 4) rm -f "$WORK/state.json"; echo 'No state for this target yet.' ;;
+            *) exit "$rc" ;;
+          esac
+
+      - name: Restore ccache
+        if: env.PACKAGES != ''
+        uses: actions/cache/restore@v5
+        with:
+          path: .work/ccache
+          key: ccache-${{ matrix.version }}-${{ matrix.arch }}-${{ github.run_id }}
+          restore-keys: ccache-${{ matrix.version }}-${{ matrix.arch }}-
+
+      - name: Build packages
+        if: env.PACKAGES != ''
+        env:
+          SOURCES_DIR: ${{ github.workspace }}/feed-sources
+          OUT_DIR: ${{ github.workspace }}/.work/build
+          CCACHE_DIR: ${{ github.workspace }}/.work/ccache
+          CCACHE_MAXSIZE: 1G
+        run: scripts/sdk-run.sh build
+
+      - name: Save ccache
+        if: always() && env.PACKAGES != ''
+        uses: actions/cache/save@v5
+        with:
+          path: .work/ccache
+          key: ccache-${{ matrix.version }}-${{ matrix.arch }}-${{ github.run_id }}
+
+      - name: Upload build logs
+        if: always() && env.PACKAGES != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-${{ matrix.version }}-${{ matrix.arch }}
+          path: |
+            .work/build/logs
+            .work/build/failures
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Merge build into feed state
+        id: merge
+        run: |
+          set -euo pipefail
+          state_args=()
+          [[ ! -f "$WORK/state.json" ]] || state_args=(--state "$WORK/state.json")
+          python3 scripts/feedctl.py merge \
+            --config targets.toml \
+            --sources feed-sources \
+            --version "$VERSION" \
+            --arch "$ARCH" \
+            "${state_args[@]}" \
+            --build-dir "$WORK/build" \
+            --out-dir "$WORK/merge"
+
+      - name: Download unchanged archives
+        run: |
+          set -euo pipefail
+          rc=0
+          rclone lsjson "$REMOTE_FEED" --files-only > "$WORK/remote.json" || rc=$?
+          case "$rc" in
+            0) ;;
+            3) echo '[]' > "$WORK/remote.json" ;;
+            *) exit "$rc" ;;
+          esac
+          python3 scripts/feedctl.py carry \
+            --state "$WORK/merge/state.json" \
+            --accepted "$WORK/merge/accepted.txt" \
+            --remote-list "$WORK/remote.json" \
+            --out "$WORK/merge/carry.txt"
+          if [[ -s "$WORK/merge/carry.txt" ]]; then
+            rclone copy "$REMOTE_FEED" "$WORK/merge/stage" --files-from "$WORK/merge/carry.txt" --no-traverse
+          fi
+
+      - name: Write signing keys
+        env:
+          KEY_BUILD: ${{ secrets.KEY_BUILD }}
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/keys"
+          [[ -z "$KEY_BUILD" ]] || printf '%s\n' "$KEY_BUILD" > "$RUNNER_TEMP/keys/key-build"
+          [[ -z "$PRIVATE_KEY" ]] || printf '%s\n' "$PRIVATE_KEY" > "$RUNNER_TEMP/keys/private-key.pem"
+
+      - name: Index and sign feed
+        env:
+          STAGE_DIR: ${{ github.workspace }}/.work/merge/stage
+          OUT_DIR: ${{ github.workspace }}/.work/index
+        run: |
+          KEYS_DIR="$RUNNER_TEMP/keys" scripts/sdk-run.sh index
+
+      - name: Remove signing keys
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/keys"
+
+      - name: Verify index
+        run: |
+          python3 scripts/feedctl.py verify \
+            --state "$WORK/merge/state.json" \
+            --stage "$WORK/merge/stage" \
+            --index-dir "$WORK/index/index" \
+            --index-meta "$WORK/index"
+
+      - name: Publish
+        run: |
+          set -euo pipefail
+          # Feed store: archives, then the index that references them. State store last:
+          # the state is the commit point, so a failure before it only causes a rebuild.
+          if [[ -s "$WORK/merge/accepted.txt" ]]; then
+            rclone copy "$WORK/merge/stage" "$REMOTE_FEED" --files-from "$WORK/merge/accepted.txt" --no-traverse
+          fi
+          rclone copy "$WORK/index/index" "$REMOTE_FEED"
+          rclone copyto "$WORK/merge/state.json" "$REMOTE_STATE"
+
+          python3 scripts/feedctl.py gc \
+            --state "$WORK/merge/state.json" \
+            --index-dir "$WORK/index/index" \
+            --remote-list "$WORK/remote.json" \
+            --out "$WORK/delete.txt"
+          if [[ -s "$WORK/delete.txt" ]]; then
+            rclone delete "$REMOTE_FEED" --files-from "$WORK/delete.txt" --no-traverse
+          fi
+
+      - name: Fail on package build errors
+        if: steps.merge.outputs.failed != ''
+        env:
+          FAILED: ${{ steps.merge.outputs.failed }}
+        run: |
+          echo "::error::Failed packages (the feed keeps their previous build; they are retried next run): $FAILED"
+          exit 1
