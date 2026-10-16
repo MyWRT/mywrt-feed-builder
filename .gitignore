@@ -1,0 +1,6 @@
+.work/
+feed-sources/
+__pycache__/
+/*.pem
+/key-build
+/rclone.*
