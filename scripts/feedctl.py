@@ -4,11 +4,13 @@
 Each target (OpenWrt version x package architecture) has one state file in the
 state store, `<storage.state>/packages-<version>/<arch>.json`:
 
-    packages: source package -> {fingerprint, status, updated_at}
-        status is built | unsupported. A package is rebuilt when its
-        fingerprint (content hash of <category>/<name> in the sources repo +
-        build recipe hash) differs. Failed builds are not recorded, so they
-        are retried on the next run.
+    packages: source package -> {fingerprint, status, updated_at[, attempts]}
+        status is built | unsupported | failed | download_failed.
+        A package is rebuilt when its fingerprint (content hash of
+        <category>/<name> in the sources repo + build recipe hash) differs, or
+        when its source download failed fewer than DOWNLOAD_ATTEMPTS runs in a
+        row. `failed` packages are not retried until the fingerprint changes
+        or a manual run names them; failure_issues.py reports them.
     files: archive filename -> {name, version, source, published_at, latest,
                                 superseded_at}
         `latest` files are exactly the ones listed in the feed index. Older
@@ -32,6 +34,7 @@ import email.parser
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -42,6 +45,10 @@ from pathlib import Path
 
 STATE_SCHEMA = 1
 ARCHIVE_SUFFIXES = (".ipk", ".apk")
+DOWNLOAD_ATTEMPTS = 3
+LOG_TAIL_LINES = 150
+LOG_TAIL_CHARS = 15000
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
 class FeedError(Exception):
@@ -224,7 +231,7 @@ def retention_keep(files: dict, now: dt.datetime, days: int, min_versions: int) 
 
 
 def needs_build(entry: dict | None, fingerprint: str) -> bool:
-    return entry is None or entry["fingerprint"] != fingerprint
+    return entry is None or entry["fingerprint"] != fingerprint or entry["status"] == "download_failed"
 
 
 def plan_target(
@@ -241,6 +248,11 @@ def plan_target(
         for name, fingerprint in fps.items()
         if full or name in forced or needs_build(packages.get(name), fingerprint)
     )
+    held = sorted(
+        name
+        for name, fingerprint in fps.items()
+        if name not in build and packages.get(name, {}).get("status") == "failed"
+    )
     remove = sorted(set(packages) - set(fps))
     stale_latest = sorted(
         name for name, meta in state["files"].items() if meta["latest"] and meta["source"] not in fps
@@ -248,7 +260,7 @@ def plan_target(
     expired = sorted(
         set(state["files"]) - retention_keep(state["files"], now, retention["days"], retention["min_versions"])
     )
-    return {"build": build, "remove": remove, "stale_latest": stale_latest, "expired": expired}
+    return {"build": build, "held": held, "remove": remove, "stale_latest": stale_latest, "expired": expired}
 
 
 def source_name(value: str) -> str:
@@ -308,11 +320,11 @@ def merge_state(
     packages, files = state["packages"], state["files"]
     stamp = format_time(now)
     succeeded = set(result.get("succeeded", []))
-    # Failed builds keep their previous state entry and are retried next run.
-    failed = set(result.get("failed", [])) | set(result.get("download_failed", []))
+    failed = set(result.get("failed", []))
+    download_failed = set(result.get("download_failed", []))
     unsupported = set(result.get("unsupported", []))
 
-    unknown = (succeeded | failed | unsupported) - set(fps)
+    unknown = (succeeded | failed | download_failed | unsupported) - set(fps)
     if unknown:
         raise FeedError(f"build result names packages missing from sources: {sorted(unknown)}")
 
@@ -323,6 +335,26 @@ def merge_state(
         packages[name] = {"fingerprint": fps[name], "status": "built", "updated_at": stamp}
     for name in sorted(unsupported):
         packages[name] = {"fingerprint": fps[name], "status": "unsupported", "updated_at": stamp}
+    for name in sorted(failed):
+        packages[name] = {"fingerprint": fps[name], "status": "failed", "updated_at": stamp}
+
+    exhausted, retrying = [], []
+    for name in sorted(download_failed):
+        previous = packages.get(name, {})
+        attempts = 1
+        if previous.get("status") == "download_failed" and previous.get("fingerprint") == fps[name]:
+            attempts = previous.get("attempts", 0) + 1
+        if attempts >= DOWNLOAD_ATTEMPTS:
+            packages[name] = {"fingerprint": fps[name], "status": "failed", "updated_at": stamp}
+            exhausted.append(name)
+        else:
+            packages[name] = {
+                "fingerprint": fps[name],
+                "status": "download_failed",
+                "attempts": attempts,
+                "updated_at": stamp,
+            }
+            retrying.append(name)
 
     replaced_sources = succeeded | unsupported
     retired = []
@@ -364,6 +396,8 @@ def merge_state(
     report = {
         "succeeded": sorted(succeeded),
         "failed": sorted(failed),
+        "download_exhausted": exhausted,
+        "download_retry": retrying,
         "unsupported": sorted(unsupported),
         "removed": removed,
         "empty": sorted(succeeded - produced),
@@ -390,6 +424,14 @@ def apply_remote_listing(state: dict, remote: set[str]) -> tuple[dict, list[str]
 
 def gc_candidates(state: dict, index_files: set[str], remote: set[str]) -> list[str]:
     return sorted(remote - set(state["files"]) - index_files)
+
+
+def log_tail(path: Path) -> str:
+    if not path.is_file():
+        return "(no log captured)"
+    text = ANSI_ESCAPE.sub("", path.read_text(encoding="utf-8", errors="replace"))
+    tail = "\n".join(text.splitlines()[-LOG_TAIL_LINES:])
+    return tail[-LOG_TAIL_CHARS:]
 
 
 # --- commands ----------------------------------------------------------------
@@ -428,7 +470,7 @@ def cmd_plan(args) -> int:
     commit = git(args.sources, "rev-parse", "HEAD").strip()
     include = []
     lines = ["### Build plan", "", f"Sources: `{commit}`", ""]
-    lines += ["| Target | Build | Remove | Expire |", "|---|---|---|---|"]
+    lines += ["| Target | Build | Held (failed) | Remove | Expire |", "|---|---|---|---|---|"]
     for entry in config["versions"]:
         version = entry["version"]
         fps = fingerprints(config, packages, version)
@@ -437,7 +479,7 @@ def cmd_plan(args) -> int:
             plan = plan_target(state, fps, forced, args.full, now, config["retention"])
             busy = plan["build"] or plan["remove"] or plan["stale_latest"] or plan["expired"]
             lines.append(
-                f"| {version} {arch} | {' '.join(plan['build']) or '-'} | "
+                f"| {version} {arch} | {' '.join(plan['build']) or '-'} | {' '.join(plan['held']) or '-'} | "
                 f"{' '.join(plan['remove']) or '-'} | {len(plan['expired'])} |"
             )
             if busy:
@@ -515,8 +557,29 @@ def cmd_merge(args) -> int:
     (args.out_dir / "accepted.txt").write_text("".join(f"{name}\n" for name in accepted), encoding="utf-8")
     write_json(args.out_dir / "report.json", report)
 
+    commit = git(args.sources, "rev-parse", "HEAD").strip()
+    failures = []
+    for kind, names, suffix in (
+        ("build", report["failed"], ".log"),
+        ("download", report["download_exhausted"], ".download.log"),
+    ):
+        for name in names:
+            failures.append(
+                {
+                    "package": name,
+                    "path": packages[name].path,
+                    "version": args.version,
+                    "arch": args.arch,
+                    "kind": kind,
+                    "sources_commit": commit,
+                    "fingerprint": fps[name],
+                    "log_tail": log_tail(args.build_dir / "failures" / f"{name}{suffix}"),
+                }
+            )
+    write_json(args.out_dir / "failures.json", failures)
+
     lines = [f"### {args.version} {args.arch}", ""]
-    for key in ("succeeded", "failed", "unsupported", "removed", "empty"):
+    for key in ("succeeded", "failed", "download_exhausted", "download_retry", "unsupported", "removed", "empty"):
         if report[key]:
             lines.append(f"- {key}: `{' '.join(report[key])}`")
     lines.append(
@@ -524,9 +587,11 @@ def cmd_merge(args) -> int:
         f"{len(report['expired'])} expired"
     )
     append_summary(args.summary, "\n".join(lines) + "\n\n")
+    for name in report["download_retry"]:
+        print(f"::warning::{name}: source download failed; it is retried on the next run")
     for name in report["empty"]:
         print(f"::warning::{name} built successfully but produced no {config['feed_name']} archives")
-    github_output(args.github_output, {"failed": " ".join(report["failed"])})
+    github_output(args.github_output, {"failed": " ".join(failure["package"] for failure in failures)})
     print(json.dumps(report, indent=2))
     return 0
 
