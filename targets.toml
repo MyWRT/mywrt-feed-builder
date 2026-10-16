@@ -26,8 +26,8 @@ config = [
 ]
 
 # rclone locations; remotes come from the RCLONE_CONFIG secret. The repository
-# variables FEED_STORE and STATE_STORE override these, e.g. to test against a
-# scratch prefix.
+# variables FEED_STORE, STATE_STORE and CATALOG_STORE override these, e.g. to
+# test against a scratch prefix.
 [storage]
 # Published feeds: <feed>/packages-<version>/<arch>/<feed_name>/. Must be
 # served over HTTP(S) without redirects (apk and opkg do not follow them).
@@ -35,6 +35,9 @@ feed = "r2:mywrt-dist"
 # Build state: <state>/packages-<version>/<arch>.json. Small, written last in
 # every publish; it is the source of truth for what the feed contains.
 state = "r2:mywrt-dist/.feed-state"
+# Public metadata catalog for the web app (docs/catalog.md). Replaced with
+# `rclone sync` on every run: must not contain the other stores.
+catalog = "r2:mywrt-dist/.feed-catalog"
 
 [retention]
 # Superseded archives stay downloadable for this many days...

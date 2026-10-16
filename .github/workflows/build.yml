@@ -34,6 +34,7 @@ env:
   # Optional overrides of [storage] in targets.toml.
   FEED_STORE: ${{ vars.FEED_STORE }}
   STATE_STORE: ${{ vars.STATE_STORE }}
+  CATALOG_STORE: ${{ vars.CATALOG_STORE }}
 
 jobs:
   plan:
@@ -336,3 +337,64 @@ jobs:
             --state-dir .work/state \
             --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             --sources-repo "$SOURCES_REPO"
+
+  catalog:
+    name: Publish catalog
+    needs:
+      - plan
+      - target
+    # Also runs when nothing was built, so a manual run refreshes the catalog.
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v6
+
+      - name: Checkout sources
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SOURCES_REPO }}
+          ref: ${{ needs.plan.outputs.sources_commit }}
+          path: feed-sources
+          fetch-depth: 1
+          ssh-key: ${{ secrets.SOURCES_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Set up Rclone
+        uses: AnimMouse/setup-rclone@v1
+        with:
+          rclone_config: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: Resolve storage
+        run: python3 scripts/feedctl.py storage --config targets.toml
+
+      - name: Download published states
+        run: |
+          set -euo pipefail
+          mkdir -p .work/state
+          rc=0
+          rclone copy "$STATE_STORE" .work/state || rc=$?
+          case "$rc" in
+            0 | 3) ;;
+            *) exit "$rc" ;;
+          esac
+
+      - name: Generate catalog
+        run: |
+          python3 scripts/feedctl.py catalog \
+            --config targets.toml \
+            --sources-config sources.toml \
+            --sources feed-sources \
+            --sources-repo "$SOURCES_REPO" \
+            --state-dir .work/state \
+            --out .work/catalog
+
+      - name: Publish catalog
+        run: |
+          set -euo pipefail
+          # Target and search documents first, then the index.json that points to them;
+          # the final sync only removes documents of targets no longer configured.
+          rclone copy .work/catalog "$CATALOG_STORE" --exclude /index.json
+          rclone copyto .work/catalog/index.json "$CATALOG_STORE/index.json"
+          rclone sync .work/catalog "$CATALOG_STORE"

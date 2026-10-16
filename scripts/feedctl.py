@@ -12,17 +12,20 @@ state store, `<storage.state>/packages-<version>/<arch>.json`:
         row. `failed` packages are not retried until the fingerprint changes
         or a manual run names them; failure_issues.py reports them.
     files: archive filename -> {name, version, source, published_at, latest,
-                                superseded_at}
+                                superseded_at, size, sha256, meta}
         `latest` files are exactly the ones listed in the feed index. Older
-        files stay downloadable until the retention policy drops them.
+        files stay downloadable until the retention policy drops them. `meta`
+        holds the control fields normalized for the catalog (opkg_meta / apk_meta).
 
 Storage locations are rclone paths from [storage] in targets.toml, overridable
-with the FEED_STORE / STATE_STORE environment variables. Publishing writes the
-archives, then the index (feed store), then the state (state store): the state
-is the commit point, so an interrupted publish only causes a rebuild.
+with the FEED_STORE / STATE_STORE / CATALOG_STORE environment variables.
+Publishing writes the archives, then the index (feed store), then the state
+(state store): the state is the commit point, so an interrupted publish only
+causes a rebuild. The catalog (docs/catalog.md) is regenerated from all states
+at the end of every run.
 
 Subcommands are called in this order by .github/workflows/build.yml:
-    storage -> plan -> target-env -> merge -> carry -> verify -> gc
+    storage -> plan -> target-env -> merge -> carry -> verify -> gc -> catalog
 """
 
 from __future__ import annotations
@@ -44,6 +47,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 STATE_SCHEMA = 1
+CATALOG_SCHEMA = 1
+SUMMARY_KEYS = ("description", "license", "url", "maintainer", "section")
+INDEX_FILES = {"apk": "packages.adb", "ipk": "Packages"}
+PACKAGE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 ARCHIVE_SUFFIXES = (".ipk", ".apk")
 DOWNLOAD_ATTEMPTS = 3
 LOG_TAIL_LINES = 150
@@ -93,7 +100,7 @@ def load_config(path: Path) -> dict:
     for key in ("feed_name", "sdk_image", "epoch", "arches", "versions", "retention", "storage"):
         if key not in config:
             raise FeedError(f"{path}: missing {key}")
-    for table, keys in (("retention", ("days", "min_versions")), ("storage", ("feed", "state"))):
+    for table, keys in (("retention", ("days", "min_versions")), ("storage", ("feed", "state", "catalog"))):
         for key in keys:
             if key not in config[table]:
                 raise FeedError(f"{path}: missing {table}.{key}")
@@ -104,13 +111,29 @@ def load_config(path: Path) -> dict:
     return config
 
 
-def storage(config: dict) -> tuple[str, str]:
-    """(feed, state) rclone paths, environment overrides first."""
-    feed, state = (
+def _contains(outer: str, inner: str) -> bool:
+    """True if rclone path `inner` is `outer` or lies below it."""
+    if outer.endswith(":"):
+        return inner.startswith(outer)
+    return inner == outer or inner.startswith(outer + "/")
+
+
+def storage(config: dict) -> tuple[str, str, str]:
+    """(feed, state, catalog) rclone paths, environment overrides first.
+
+    The catalog is published with `rclone sync`, and the whole state store is
+    downloaded by every run, so the catalog may neither contain the feed or
+    state store nor lie inside the state store."""
+    feed, state, catalog = (
         (os.environ.get(f"{key.upper()}_STORE") or config["storage"][key]).rstrip("/")
-        for key in ("feed", "state")
+        for key in ("feed", "state", "catalog")
     )
-    return feed, state
+    if _contains(catalog, feed) or _contains(catalog, state) or _contains(state, catalog):
+        raise FeedError(
+            f"storage.catalog ({catalog}) must not contain the feed ({feed}) or state ({state}) store, "
+            "nor lie inside the state store"
+        )
+    return feed, state, catalog
 
 
 def version_entry(config: dict, version: str) -> dict:
@@ -267,6 +290,58 @@ def source_name(value: str) -> str:
     return value.rstrip("/").rsplit("/", 1)[-1]
 
 
+def split_list(value: str | None) -> list[str]:
+    return [item.strip() for item in (value or "").split(",") if item.strip()]
+
+
+def unfold(value: str | None) -> str | None:
+    """Join a folded control field (continuation lines start with a space)."""
+    if not value:
+        return None
+    return "\n".join(line.strip() for line in value.splitlines()).strip() or None
+
+
+def to_int(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def opkg_meta(fields) -> dict:
+    return {
+        "arch": fields.get("Architecture"),
+        "description": unfold(fields.get("Description")),
+        "depends": split_list(fields.get("Depends")),
+        "provides": split_list(fields.get("Provides")),
+        "license": fields.get("License"),
+        "section": fields.get("Section"),
+        "maintainer": fields.get("Maintainer"),
+        "url": fields.get("URL"),
+        "installed_size": to_int(fields.get("Installed-Size")),
+        "abi_version": fields.get("ABIVersion"),
+    }
+
+
+def apk_meta(package: dict) -> dict:
+    abi = next(
+        (tag.split("=", 1)[1] for tag in package.get("tags", []) if tag.startswith("openwrt:abiversion=")),
+        None,
+    )
+    return {
+        "arch": package.get("arch"),
+        "description": unfold(package.get("description")),
+        "depends": [str(item) for item in package.get("depends", [])],
+        "provides": [str(item) for item in package.get("provides", [])],
+        "license": package.get("license"),
+        "section": None,
+        "maintainer": package.get("maintainer"),
+        "url": package.get("url"),
+        "installed_size": to_int(package.get("installed-size")),
+        "abi_version": abi,
+    }
+
+
 def read_index_metadata(directory: Path) -> list[dict]:
     """Archive metadata from an index dump written by sdk/entry.sh."""
     manifest = directory / "Packages.manifest"
@@ -287,6 +362,7 @@ def read_index_metadata(directory: Path) -> list[dict]:
                     "name": fields["Package"],
                     "version": fields["Version"],
                     "source": source_name(fields["Source"]),
+                    "meta": opkg_meta(fields),
                 }
             )
     elif adb_dump.exists():
@@ -302,6 +378,7 @@ def read_index_metadata(directory: Path) -> list[dict]:
                     "name": package["name"],
                     "version": package["version"],
                     "source": source_name(package["origin"]),
+                    "meta": apk_meta(package),
                 }
             )
     return entries
@@ -369,13 +446,17 @@ def merge_state(
     for entry in new_files:
         if entry["source"] not in succeeded:
             continue
-        files[entry["filename"]] = {
+        record = {
             "name": entry["name"],
             "version": entry["version"],
             "source": entry["source"],
             "published_at": stamp,
             "latest": True,
         }
+        for key in ("size", "sha256", "meta"):
+            if key in entry:
+                record[key] = entry[key]
+        files[entry["filename"]] = record
         accepted.append(entry["filename"])
         produced.add(entry["source"])
 
@@ -499,8 +580,8 @@ def cmd_plan(args) -> int:
 
 
 def cmd_storage(args) -> int:
-    feed, state = storage(load_config(args.config))
-    values = {"FEED_STORE": feed, "STATE_STORE": state}
+    feed, state, catalog = storage(load_config(args.config))
+    values = {"FEED_STORE": feed, "STATE_STORE": state, "CATALOG_STORE": catalog}
     github_output(args.github_env, values)
     for key, value in values.items():
         print(f"{key}={value}")
@@ -513,7 +594,7 @@ def cmd_target_env(args) -> int:
     if args.arch not in config["arches"]:
         raise FeedError(f"arch {args.arch} is not configured")
     golang = entry.get("golang") or {}
-    feed, state = storage(config)
+    feed, state, _catalog = storage(config)
     target = f"packages-{args.version}"
     values = {
         "WORK": str(Path(os.environ.get("GITHUB_WORKSPACE", ".")).resolve() / ".work"),
@@ -546,6 +627,9 @@ def cmd_merge(args) -> int:
         archive = args.build_dir / "packages" / entry["filename"]
         if not archive.is_file():
             raise FeedError(f"indexed archive missing from build output: {entry['filename']}")
+        entry["size"] = archive.stat().st_size
+        with archive.open("rb") as handle:
+            entry["sha256"] = hashlib.file_digest(handle, "sha256").hexdigest()
 
     state, accepted, report = merge_state(state, fps, result, new_files, now, config["retention"])
 
@@ -593,6 +677,197 @@ def cmd_merge(args) -> int:
         print(f"::warning::{name} built successfully but produced no {config['feed_name']} archives")
     github_output(args.github_output, {"failed": " ".join(failure["package"] for failure in failures)})
     print(json.dumps(report, indent=2))
+    return 0
+
+
+def load_upstreams(path: Path) -> dict[str, dict]:
+    """Package name -> upstream {repo, branch, path} from sources.toml."""
+    with path.open("rb") as handle:
+        data = tomllib.load(handle)
+    return {
+        package["name"]: {"repo": package["repo"], "branch": package.get("branch"), "path": package.get("path", ".")}
+        for package in data.get("package", [])
+    }
+
+
+def archive_format(files: dict) -> str | None:
+    suffixes = {Path(name).suffix for name in files}
+    if ".apk" in suffixes:
+        return "apk"
+    if ".ipk" in suffixes:
+        return "ipk"
+    return None
+
+
+def build_catalog(
+    config: dict,
+    states: dict[tuple[str, str], dict],
+    packages: dict[str, SourcePackage],
+    upstreams: dict[str, dict],
+    sources_repo: str,
+    commit: str,
+    now: dt.datetime,
+) -> dict[str, dict]:
+    """Relative path -> JSON document for the published catalog (see docs/catalog.md).
+    `branch` is the OpenWrt release line (a [[versions]] entry)."""
+    feed = config["feed_name"]
+    generated_at = format_time(now)
+    branches = [entry["version"] for entry in config["versions"]]
+    arches = list(config["arches"])
+    targets = []
+    details: dict[str, dict] = {}
+
+    for branch in branches:
+        for arch in arches:
+            state = states.get((branch, arch))
+            if state is None:
+                continue
+            fmt = archive_format(state["files"])
+            path = f"packages-{branch}/{arch}/{feed}"
+            by_name: dict[str, list[tuple[str, dict]]] = defaultdict(list)
+            for filename, record in state["files"].items():
+                by_name[record["name"]].append((filename, record))
+
+            indexed = 0
+            for name, entries in sorted(by_name.items()):
+                current = [(filename, record) for filename, record in entries if record["latest"]]
+                if not current:
+                    continue
+                if not PACKAGE_NAME.match(name):
+                    raise FeedError(f"package name {name!r} cannot be used as a catalog file name")
+                indexed += 1
+                filename, record = current[0]
+                meta = record.get("meta", {})
+                detail = details.setdefault(
+                    name,
+                    {"name": name, "source": record["source"], **dict.fromkeys(SUMMARY_KEYS), "targets": []},
+                )
+                for key in SUMMARY_KEYS:
+                    detail[key] = detail[key] or meta.get(key)
+                previous = sorted(
+                    (item for item in entries if not item[1]["latest"]),
+                    key=lambda item: item[1]["published_at"],
+                    reverse=True,
+                )
+                detail["targets"].append(
+                    {
+                        "branch": branch,
+                        "arch": arch,
+                        "format": fmt,
+                        "path": path,
+                        "filename": filename,
+                        "version": record["version"],
+                        "package_arch": meta.get("arch"),
+                        "size": record.get("size"),
+                        "installed_size": meta.get("installed_size"),
+                        "sha256": record.get("sha256"),
+                        "depends": meta.get("depends") or [],
+                        "provides": meta.get("provides") or [],
+                        "abi_version": meta.get("abi_version"),
+                        "published_at": record["published_at"],
+                        "previous": [
+                            {
+                                "filename": old_filename,
+                                "version": old["version"],
+                                "size": old.get("size"),
+                                "sha256": old.get("sha256"),
+                                "published_at": old["published_at"],
+                                "superseded_at": old.get("superseded_at"),
+                            }
+                            for old_filename, old in previous
+                        ],
+                    }
+                )
+            targets.append(
+                {
+                    "branch": branch,
+                    "arch": arch,
+                    "format": fmt,
+                    "path": path,
+                    "index": INDEX_FILES.get(fmt),
+                    "updated_at": state.get("updated_at"),
+                    "packages": indexed,
+                }
+            )
+
+    documents: dict[str, dict] = {}
+    search = []
+    for name in sorted(details):
+        detail = details[name]
+        source = packages.get(detail["source"])
+        available = {(target["branch"], target["arch"]) for target in detail["targets"]}
+        detail["source_path"] = source.path if source else None
+        detail["category"] = source.path.split("/", 1)[0] if source else None
+        detail["upstream"] = upstreams.get(detail["source"])
+        detail["unavailable"] = [
+            {
+                "branch": branch,
+                "arch": arch,
+                "status": states.get((branch, arch), {}).get("packages", {}).get(detail["source"], {}).get("status"),
+            }
+            for branch in branches
+            for arch in arches
+            if (branch, arch) not in available
+        ]
+        documents[f"packages/{name}.json"] = {"schema": CATALOG_SCHEMA, "feed": feed, "generated_at": generated_at, **detail}
+        search.append(
+            {
+                "name": name,
+                "source": detail["source"],
+                "category": detail["category"],
+                "description": detail["description"],
+                "license": detail["license"],
+                "maintainer": detail["maintainer"],
+                "targets": [
+                    {key: target[key] for key in ("branch", "arch", "version", "published_at")}
+                    for target in detail["targets"]
+                ],
+            }
+        )
+
+    documents["search.json"] = {
+        "schema": CATALOG_SCHEMA,
+        "feed": feed,
+        "generated_at": generated_at,
+        "packages": search,
+    }
+    documents["index.json"] = {
+        "schema": CATALOG_SCHEMA,
+        "feed": feed,
+        "generated_at": generated_at,
+        "sources": {"repository": sources_repo, "commit": commit},
+        "branches": branches,
+        "arches": arches,
+        "targets": targets,
+        "search": "search.json",
+        "package": "packages/{name}.json",
+    }
+    return documents
+
+
+def cmd_catalog(args) -> int:
+    config = load_config(args.config)
+    packages = source_packages(args.sources, config.get("exclude", []))
+    states = {}
+    for entry in config["versions"]:
+        for arch in config["arches"]:
+            path = state_path(args.state_dir, entry["version"], arch)
+            if path.exists():
+                states[(entry["version"], arch)] = load_state(path, entry["version"], arch)
+    documents = build_catalog(
+        config,
+        states,
+        packages,
+        load_upstreams(args.sources_config),
+        args.sources_repo,
+        git(args.sources, "rev-parse", "HEAD").strip(),
+        now_arg(args.now),
+    )
+    if args.out.exists():
+        shutil.rmtree(args.out)
+    for relative, document in documents.items():
+        write_json(args.out / relative, document)
+    print(f"catalog: {len(states)} targets, {len(documents['search.json']['packages'])} packages")
     return 0
 
 
@@ -708,6 +983,16 @@ def build_parser() -> argparse.ArgumentParser:
     gc.add_argument("--remote-list", type=Path, required=True)
     gc.add_argument("--out", type=Path, required=True)
     gc.set_defaults(func=cmd_gc)
+
+    catalog = sub.add_parser("catalog", help="generate the public metadata catalog from all target states")
+    catalog.add_argument("--config", type=Path, required=True)
+    catalog.add_argument("--sources-config", type=Path, required=True, help="sources.toml")
+    catalog.add_argument("--sources", type=Path, required=True)
+    catalog.add_argument("--sources-repo", required=True)
+    catalog.add_argument("--state-dir", type=Path, required=True)
+    catalog.add_argument("--out", type=Path, required=True)
+    catalog.add_argument("--now")
+    catalog.set_defaults(func=cmd_catalog)
     return parser
 
 
