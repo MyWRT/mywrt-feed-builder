@@ -1,0 +1,51 @@
+# Build targets and feed policy.
+#
+# The build recipe is feed_name, sdk_image, epoch, config and the [[versions]]
+# entry: changing any of them rebuilds every package of the affected versions.
+
+feed_name = "mywrt"
+sdk_image = "immortalwrt/sdk"
+
+# Bump to rebuild every package.
+epoch = 1
+
+# Package architectures; the SDK image is <sdk_image>:<arch>-openwrt-<version>.
+arches = [
+  "x86_64",
+  "aarch64_generic",
+  "arm_cortex-a7_neon-vfpv4",
+]
+
+# Source packages never built. Published builds of them are removed.
+exclude = []
+
+# Extra .config lines for every build.
+config = [
+  # ruby (pulled in by OpenClash) would otherwise build Rust and LLVM from source.
+  "# CONFIG_RUBY_ENABLE_YJIT is not set",
+]
+
+# rclone locations; remotes come from the RCLONE_CONFIG secret. The repository
+# variables FEED_STORE and STATE_STORE override these, e.g. to test against a
+# scratch prefix.
+[storage]
+# Published feeds: <feed>/packages-<version>/<arch>/<feed_name>/. Must be
+# served over HTTP(S) without redirects (apk and opkg do not follow them).
+feed = "r2:mywrt-dist"
+# Build state: <state>/packages-<version>/<arch>.json. Small, written last in
+# every publish; it is the source of truth for what the feed contains.
+state = "r2:mywrt-dist/.feed-state"
+
+[retention]
+# Superseded archives stay downloadable for this many days...
+days = 30
+# ...and the newest archives of every published package are always kept.
+min_versions = 2
+
+[[versions]]
+version = "25.12"
+
+[[versions]]
+version = "24.10"
+# Replace the SDK Go toolchain with a newer one.
+golang = { repo = "https://github.com/sbwml/packages_lang_golang", branch = "26.x" }
