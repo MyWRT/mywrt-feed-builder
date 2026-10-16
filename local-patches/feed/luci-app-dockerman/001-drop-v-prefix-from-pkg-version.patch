@@ -1,0 +1,6 @@
+diff --git a/Makefile b/Makefile
+--- a/Makefile
++++ b/Makefile
+@@ -17 +17 @@
+-PKG_VERSION:=v0.5.26
++PKG_VERSION:=0.5.26

@@ -1,0 +1,6 @@
+diff --git a/Makefile b/Makefile
+--- a/Makefile
++++ b/Makefile
+@@ -56 +56 @@ define Package/openlist
+-  DEPENDS:=$(GO_ARCH_DEPENDS) +ca-bundle
++  DEPENDS:=$(GO_ARCH_DEPENDS) +ca-bundle +libfuse
