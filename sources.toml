@@ -1,0 +1,189 @@
+# Packages synced into MyWRT/mywrt-feed-sources as <category>/<name>/.
+#
+#   name      package directory name; must be unique across categories
+#   category  top-level directory in the sources repository
+#   repo      upstream git repository
+#   branch    optional; default branch when omitted
+#   path      optional; directory inside the repository, default "."
+#
+# Fixes to upstream packages go in local-patches/<feed|source>/<name>/.
+
+# --- luci ------------------------------------------------------------------
+
+[[package]]
+name = "luci-theme-design"
+category = "luci"
+repo = "https://github.com/papagaye744/luci-theme-design.git"
+branch = "js"
+
+[[package]]
+name = "luci-app-design-config"
+category = "luci"
+repo = "https://github.com/gngpp/luci-app-design-config.git"
+
+[[package]]
+name = "luci-theme-aurora"
+category = "luci"
+repo = "https://github.com/eamonxg/luci-theme-aurora.git"
+
+[[package]]
+name = "luci-app-aurora-config"
+category = "luci"
+repo = "https://github.com/eamonxg/luci-app-aurora-config.git"
+
+[[package]]
+name = "luci-theme-material3"
+category = "luci"
+repo = "https://github.com/KawaiiHachimi/luci-theme-material3.git"
+
+[[package]]
+name = "luci-theme-glass"
+category = "luci"
+repo = "https://github.com/rchen14b/luci-theme-glass.git"
+
+[[package]]
+name = "luci-theme-proton2025"
+category = "luci"
+repo = "https://github.com/ChesterGoodiny/luci-theme-proton2025.git"
+
+[[package]]
+name = "luci-theme-shadcn"
+category = "luci"
+repo = "https://github.com/eamonxg/luci-theme-shadcn.git"
+
+[[package]]
+name = "luci-app-natmapt"
+category = "luci"
+repo = "https://github.com/muink/luci-app-natmapt.git"
+
+[[package]]
+name = "luci-app-turboacc"
+category = "luci"
+repo = "https://github.com/chenmozhijin/turboacc.git"
+branch = "luci"
+path = "luci-app-turboacc"
+
+[[package]]
+name = "luci-app-passwall2"
+category = "luci"
+repo = "https://github.com/Openwrt-Passwall/openwrt-passwall2.git"
+path = "luci-app-passwall2"
+
+[[package]]
+name = "luci-app-mosdns"
+category = "luci"
+repo = "https://github.com/sbwml/luci-app-mosdns.git"
+path = "luci-app-mosdns"
+
+[[package]]
+name = "luci-app-openclash"
+category = "luci"
+repo = "https://github.com/vernesong/OpenClash.git"
+path = "luci-app-openclash"
+
+[[package]]
+name = "luci-app-wechatpush"
+category = "luci"
+repo = "https://github.com/tty228/luci-app-wechatpush.git"
+
+[[package]]
+name = "luci-app-adguardhome"
+category = "luci"
+repo = "https://github.com/kenzok78/luci-app-adguardhome"
+
+[[package]]
+name = "luci-app-openlist"
+category = "luci"
+repo = "https://github.com/OpenListTeam/OpenList-OpenWRT.git"
+path = "luci-app-openlist"
+
+[[package]]
+name = "luci-lib-docker"
+category = "luci"
+repo = "https://github.com/lisaac/luci-lib-docker.git"
+path = "collections/luci-lib-docker"
+
+[[package]]
+name = "luci-app-dockerman"
+category = "luci"
+repo = "https://github.com/lisaac/luci-app-dockerman.git"
+path = "applications/luci-app-dockerman"
+
+[[package]]
+name = "luci-app-easytier"
+category = "luci"
+repo = "https://github.com/EasyTier/luci-app-easytier.git"
+path = "luci-app-easytier"
+
+[[package]]
+name = "luci-app-bandix"
+category = "luci"
+repo = "https://github.com/timsaya/luci-app-bandix.git"
+path = "luci-app-bandix"
+
+[[package]]
+name = "luci-app-fakehttp"
+category = "luci"
+repo = "https://github.com/yingziwu/luci-app-fakehttp.git"
+
+# --- net -------------------------------------------------------------------
+
+[[package]]
+name = "natmapt"
+category = "net"
+repo = "https://github.com/muink/openwrt-natmapt.git"
+
+[[package]]
+name = "stuntman"
+category = "net"
+repo = "https://github.com/muink/openwrt-stuntman.git"
+
+[[package]]
+name = "mosdns"
+category = "net"
+repo = "https://github.com/sbwml/luci-app-mosdns.git"
+path = "mosdns"
+
+[[package]]
+name = "openlist"
+category = "net"
+repo = "https://github.com/OpenListTeam/OpenList-OpenWRT.git"
+path = "openlist"
+
+[[package]]
+name = "easytier"
+category = "net"
+repo = "https://github.com/EasyTier/luci-app-easytier.git"
+path = "easytier"
+
+[[package]]
+name = "openwrt-bandix"
+category = "net"
+repo = "https://github.com/timsaya/openwrt-bandix.git"
+path = "openwrt-bandix"
+
+[[package]]
+name = "openwrt-fakehttp"
+category = "net"
+repo = "https://github.com/yingziwu/openwrt-fakehttp.git"
+
+# --- utils -----------------------------------------------------------------
+
+[[package]]
+name = "geo2txt"
+category = "utils"
+repo = "https://github.com/sbwml/luci-app-mosdns.git"
+path = "geo2txt"
+
+[[package]]
+name = "airsaned"
+category = "utils"
+repo = "https://github.com/MyWRT/AirSane-openwrt.git"
+path = "airsaned"
+
+# --- telephony -------------------------------------------------------------
+
+[[package]]
+name = "asterisk-chan-quectel"
+category = "telephony"
+repo = "https://github.com/etnperlong/openwrt-asterisk-chan-quectel.git"
