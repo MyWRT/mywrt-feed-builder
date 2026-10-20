@@ -113,9 +113,15 @@ def load_config(path: Path) -> dict:
 
 def _contains(outer: str, inner: str) -> bool:
     """True if rclone path `inner` is `outer` or lies below it."""
+    outer, inner = outer.rstrip("/"), inner.rstrip("/")
     if outer.endswith(":"):
         return inner.startswith(outer)
     return inner == outer or inner.startswith(outer + "/")
+
+
+def _store_path(base: str, path: str) -> str:
+    """Append a path without turning a bare remote into an absolute root."""
+    return base + path if base.endswith(":") else f"{base.rstrip('/')}/{path}"
 
 
 def storage(config: dict) -> tuple[str, str, str]:
@@ -125,7 +131,7 @@ def storage(config: dict) -> tuple[str, str, str]:
     downloaded by every run, so the catalog may neither contain the feed or
     state store nor lie inside the state store."""
     feed, state, catalog = (
-        (os.environ.get(f"{key.upper()}_STORE") or config["storage"][key]).rstrip("/")
+        os.environ.get(f"{key.upper()}_STORE") or config["storage"][key]
         for key in ("feed", "state", "catalog")
     )
     if _contains(catalog, feed) or _contains(catalog, state) or _contains(state, catalog):
@@ -598,8 +604,8 @@ def cmd_target_env(args) -> int:
     target = f"packages-{args.version}"
     values = {
         "WORK": str(Path(os.environ.get("GITHUB_WORKSPACE", ".")).resolve() / ".work"),
-        "REMOTE_FEED": f"{feed}/{target}/{args.arch}/{config['feed_name']}",
-        "REMOTE_STATE": f"{state}/{target}/{args.arch}.json",
+        "REMOTE_FEED": _store_path(feed, f"{target}/{args.arch}/{config['feed_name']}"),
+        "REMOTE_STATE": _store_path(state, f"{target}/{args.arch}.json"),
         "SDK_IMAGE": config["sdk_image"],
         "FEED_NAME": config["feed_name"],
         "REPLACE_GOLANG": "1" if golang else "0",

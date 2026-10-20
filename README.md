@@ -108,6 +108,11 @@ All stores are rclone paths set in `[storage]` of `targets.toml`, using remotes
 from the `RCLONE_CONFIG` secret, so any rclone backend works (R2, S3, Dropbox,
 ...).
 
+Use a bare remote such as `FEED_STORE=dropbox:` for paths relative to that
+remote's default root; targets become `dropbox:packages-<version>/<arch>/<feed_name>`.
+An explicit `dropbox:/` selects the account/team root instead and is not supported
+by Dropbox App Folder apps. Subdirectory roots such as `dropbox:feeds` also work.
+
 | Store | Holds | Requirements |
 |---|---|---|
 | feed (`storage.feed`) | archives and signed indexes | large; served to devices over HTTP(S) **without redirects**: apk and opkg do not follow them, so Dropbox needs a proxy in front that streams files |
